@@ -4,9 +4,10 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { buildSystemPrompt } from '../lib/systemPrompt.js';
-import { getSession, saveSession } from '../lib/sessions.js';
+import { getConversacion } from '../lib/conversacion.js';
 import { logDecision, initSheet } from '../lib/logger.js';
 import { isConfigured, buscarProductosDirecto } from '../lib/shopifyClient.js';
+import { escalarASoporte } from '../lib/escalar.js';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -56,11 +57,39 @@ Usar cuando el cliente pregunta por medidas, tallas o cómo saber su talla.`,
       },
       required: ['tipo']
     }
+  },
+  {
+    name: 'escalar_a_soporte',
+    description: `Deriva la conversación a un asesor humano de soporte, de forma INVISIBLE para el cliente.
+ÚSALA cuando NO sepas la respuesta con certeza o NO conozcas el proceso: cambios/devoluciones, estado de un envío, un pago que no cuadra, un reclamo, un caso raro fuera de venta, un audio que no puedes procesar, o cualquier duda que no puedas resolver con tus tools.
+NO la uses para dudas normales de producto/precio/talla (esas las resuelves tú), ni por falta de stock de un producto que sí existe.
+Al llamarla, responde SOLO con un breve mensaje de espera en tu misma voz. NUNCA menciones que pasas con otra persona, humano, equipo, asesor o soporte, ni des ningún número de WhatsApp.`,
+    input_schema: {
+      type: 'object',
+      properties: {
+        motivo: {
+          type: 'string',
+          description: 'Motivo breve de la derivación, para el asesor. Ej: "pregunta por devolución", "estado de envío", "audio".'
+        }
+      },
+      required: ['motivo']
+    }
   }
 ];
 
 // ── EJECUTAR TOOL ─────────────────────────────────────────────────
-async function executeTool(toolName, toolInput) {
+async function executeTool(toolName, toolInput, phone = '') {
+  if (toolName === 'escalar_a_soporte') {
+    try { await escalarASoporte(phone); }
+    catch (err) { console.error('escalar_a_soporte falló:', err.message); }
+    // Éxito aunque el write falle: el cliente igual recibe el mensaje de espera
+    // y un asesor puede tomar el chat manualmente desde el inbox.
+    return {
+      escalado: true,
+      instruccion: 'Responde SOLO con este mensaje de espera, tal cual, sin agregar nada más: "Permíteme un momento, verifico esto y te confirmo enseguida 🖤". NUNCA menciones ejecutivo, humano, equipo, asesor, soporte, "otra persona" ni ningún número de WhatsApp — para el cliente sigues siendo tú.'
+    };
+  }
+
   if (toolName === 'buscar_productos') {
     const { keyword } = toolInput;
 
@@ -106,7 +135,7 @@ export default async function handler(req, res) {
   if (req.method !== 'POST')   return res.status(405).json({ error: 'Method not allowed' });
   if (!isAuthorized(req))      return res.status(401).json({ error: 'Unauthorized' });
 
-  const { phone, message, name, image_url, media_url, source, reset_session, shopify_context } = req.body || {};
+  const { phone, message, name, image_url, media_url, source, reset_session, shopify_context, history: historyOverride } = req.body || {};
 
   if (!phone || (!message && !image_url && !media_url)) {
     return res.status(400).json({ error: 'Faltan campos: phone y message (o image_url)' });
@@ -116,8 +145,17 @@ export default async function handler(req, res) {
   let toolUsada = '', keywordShopify = '', productosEncontrados = 0, clasificacion = '', fuenteProductos = '';
 
   try {
-    const session = reset_session ? { messages: [], meta: {} } : getSession(phone);
-    const history = session.messages;
+    // Historial (memoria del hilo) LEÍDO DEL INBOX de IND — fuente de verdad
+    // (inbox.mensajes en Supabase; incluye lo que respondió un vendedor humano).
+    // El endpoint ya quita el último mensaje del cliente (el actual), que agregamos
+    // nosotros abajo. Si el inbox falla → [], pero Indi responde igual.
+    //
+    // `history` en el body = override SOLO PARA PRUEBAS (playground): permite
+    // conversación multi-turno sin escribir al inbox. El webhook de producción NO
+    // lo manda, así que en vivo se lee del inbox como siempre.
+    const history = reset_session
+      ? []
+      : (Array.isArray(historyOverride) ? historyOverride : await getConversacion(phone, 20));
 
     // Contenido del usuario
     const imageUrl = image_url || media_url;
@@ -161,11 +199,11 @@ export default async function handler(req, res) {
 
       toolUsada      = toolUseBlock.name;
       keywordShopify = toolUseBlock.input?.keyword || '';
-      clasificacion  = 'PRODUCTO';
+      clasificacion  = toolUsada === 'escalar_a_soporte' ? 'SOPORTE' : 'PRODUCTO';
 
       console.log(`INDx tool: ${toolUsada} → "${keywordShopify}"`);
 
-      const toolResult = await executeTool(toolUseBlock.name, toolUseBlock.input);
+      const toolResult = await executeTool(toolUseBlock.name, toolUseBlock.input, phone);
       if (toolResult.productos) {
         productosEncontrados = toolResult.productos.split(' ||| ').length;
       }
@@ -197,26 +235,10 @@ export default async function handler(req, res) {
 
     if (!toolUsada) clasificacion = 'OTRO';
 
-    // Guardar historial limpio
-    const userMsg          = { role: 'user', content: typeof userContent === 'string' ? userContent : (message || '[imagen]') };
-    const assistantFinalMsg= { role: 'assistant', content: reply };
-    const newHistory       = [...history, userMsg];
-
-    if (intermediateMessages.length > 0) {
-      const toolResultMsg = intermediateMessages.find(m =>
-        m.role === 'user' && Array.isArray(m.content) && m.content[0]?.type === 'tool_result'
-      );
-      if (toolResultMsg) {
-        const toolContent = toolResultMsg.content[0]?.content || '';
-        newHistory.push(
-          { role: 'assistant', content: `[CATÁLOGO IND CONSULTADO: ${toolContent}]` },
-          { role: 'user',      content: 'ok, basándote en ese catálogo responde mi pregunta anterior' }
-        );
-      }
-    }
-
-    newHistory.push(assistantFinalMsg);
-    saveSession(phone, newHistory, { name, source, lastReply: reply.slice(0, 100) });
+    // NO persistimos aquí: el inbox de IND es la fuente de verdad. El mensaje
+    // entrante ya lo guardó el webhook y la respuesta la guardará /api/saliente
+    // cuando el inbox la envíe. Así Indi lee SIEMPRE la conversación real —
+    // incluidas las intervenciones de un vendedor humano — en el próximo turno.
 
     const elapsed = Date.now() - startTime;
 
@@ -234,7 +256,7 @@ export default async function handler(req, res) {
       phone, tienda: 'INDSTORE', source: source || 'unknown',
       tool_used: toolUsada, keyword: keywordShopify,
       productos_encontrados: productosEncontrados, fuente_productos: fuenteProductos,
-      context_turns: Math.floor(newHistory.length / 2),
+      context_turns: Math.floor(history.length / 2) + 1,
       tokens: { input: totalInputTokens, output: totalOutputTokens },
       elapsed_ms: elapsed
     });

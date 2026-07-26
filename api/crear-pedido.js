@@ -137,9 +137,15 @@ export default async function handler(req, res) {
       direccionTexto: direccion,
     };
 
+    // La API del CRM dejó de estar abierta: ahora exige sesión de persona o
+    // token de máquina. Este es el token de máquina (mismo valor que CRM_API_TOKEN
+    // en el proyecto del CRM). Sin él, el CRM responde 401 y no se crea el pedido.
     const crmRes = await fetch(CRM_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.CRM_API_TOKEN || ''}`,
+      },
       body: JSON.stringify(payload),
     });
     const crm = await crmRes.json().catch(() => ({}));

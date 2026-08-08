@@ -120,9 +120,44 @@ async function executeTool(toolName, toolInput, phone = '') {
 }
 
 // ── AUTH ──────────────────────────────────────────────────────────
+//
+// ⚠️ ROTACIÓN (8-ago-2026). La clave vieja quedó PUBLICADA: el inbox de IND la
+// tenía quemada como respaldo (`|| 'mandi_republic_2024'` en su webhook) y ese
+// repo es público, así que cualquiera podía llamar a esta IA y quemar créditos
+// de Anthropic. Era además LA MISMA clave que el agente de MANDI.
+//
+// Se acepta la vieja Y la nueva durante la transición, para no cortar las
+// respuestas a los clientes al cambiarla en un lado antes que en el otro:
+//   1. este paso (las dos valen)          ← estás acá
+//   2. el inbox de IND pasa a mandar la nueva
+//   3. se borra MANDI_API_KEY_VIEJA y esta rama muere
+//
+// PASO 3 PENDIENTE: mientras `MANDI_API_KEY_VIEJA` siga definida en Vercel, la
+// clave publicada sigue sirviendo.
+//
+// Se compara en tiempo constante y limpiando invisibles: un `===` deja adivinar
+// la clave midiendo tiempos, y cargar variables a Vercel desde PowerShell les
+// pega un BOM que rompe la comparación SOLO en producción.
+function limpia(v) {
+  return String(v || '').replace(/[^\x21-\x7E]/g, '');
+}
+
+function igualEnTiempoConstante(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  let dif = 0;
+  for (let i = 0; i < a.length; i++) dif |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return dif === 0;
+}
+
 function isAuthorized(req) {
-  const key = req.headers['x-mandi-key'] || req.headers['authorization']?.replace('Bearer ', '');
-  return key === process.env.MANDI_API_KEY;
+  const key = limpia(req.headers['x-mandi-key'] || req.headers['authorization']?.replace('Bearer ', ''));
+  if (!key) return false;
+  const nueva = limpia(process.env.MANDI_API_KEY);
+  const vieja = limpia(process.env.MANDI_API_KEY_VIEJA);
+  // Sin ninguna clave configurada NO se deja pasar: falla cerrado.
+  if (!nueva && !vieja) return false;
+  return (nueva && igualEnTiempoConstante(key, nueva))
+      || (vieja && igualEnTiempoConstante(key, vieja));
 }
 
 // ── HANDLER PRINCIPAL ─────────────────────────────────────────────

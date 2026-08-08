@@ -176,7 +176,18 @@ export default async function handler(req, res) {
       systemPrompt += `\n\n## 🛒 PRODUCTOS DISPONIBLES EN IND STORE (datos reales de Shopify):\n${shopify_context}\n\n⚠️ IMPORTANTE: Estos productos YA FUERON encontrados en Shopify. ÚSALOS DIRECTAMENTE sin llamar la tool buscar_productos. Si el cliente pregunta por uno de estos, confirma precio, tallas y cierra la venta YA.`;
     }
 
-    const apiMessages = [...history, { role: 'user', content: userContent }];
+    // El ENTRANTE actual normalmente YA está en `history` (el webhook lo guardó en
+    // Supabase antes de llamarnos), así que solo lo agregamos si aún no aparece —
+    // evita duplicarlo y romper la alternancia. (En playground, history viene por
+    // override sin el mensaje actual → se agrega.)
+    const incomingText = (message || '').trim();
+    const ultimo = history[history.length - 1];
+    const yaEnHistorial = !!ultimo && ultimo.role === 'user'
+      && typeof ultimo.content === 'string' && incomingText.length > 0
+      && ultimo.content.split('\n').some((l) => l.trim() === incomingText);
+    const apiMessages = yaEnHistorial
+      ? [...history]
+      : [...history, { role: 'user', content: userContent }];
 
     // ── PRIMERA LLAMADA A CLAUDE ──────────────────────────────────
     let response = await anthropic.messages.create({
@@ -256,7 +267,7 @@ export default async function handler(req, res) {
       phone, tienda: 'INDSTORE', source: source || 'unknown',
       tool_used: toolUsada, keyword: keywordShopify,
       productos_encontrados: productosEncontrados, fuente_productos: fuenteProductos,
-      context_turns: Math.floor(history.length / 2) + 1,
+      context_turns: Math.floor(apiMessages.length / 2),
       tokens: { input: totalInputTokens, output: totalOutputTokens },
       elapsed_ms: elapsed
     });

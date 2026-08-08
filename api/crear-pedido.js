@@ -73,11 +73,45 @@ const OBLIGATORIOS = [
   ['precio','precio'],
 ];
 
+// ── La puerta ────────────────────────────────────────────────────────────────
+// Hasta el 8-ago-2026 este endpoint aceptaba un POST de CUALQUIERA, sin ninguna
+// credencial, y creaba pedidos REALES en el CRM. Es el caso de manual del
+// "diputado confundido": quien llama es anónimo, pero el endpoint sí tiene
+// credenciales (CRM_API_TOKEN) y las usa a nombre de la empresa. De paso, cada
+// llamada gastaba créditos de Anthropic porque le pide a Claude que extraiga
+// los datos de la conversación.
+//
+// Ahora exige token de máquina en `Authorization: Bearer …`.
+// Mismo arreglo y mismo nombre de variable que en mandi-agent (`aa586a7`), para
+// que los dos repos se lean igual.
+//
+// ⚠️ Dos secretos DISTINTOS, no los mezcles:
+//   CREAR_PEDIDO_API_TOKEN → quién puede llamarnos A NOSOTROS (esta puerta)
+//   CRM_API_TOKEN          → con qué hablamos NOSOTROS CON el CRM (más abajo)
+//
+// ⚠️ Se limpian los caracteres invisibles: cargar variables a Vercel desde
+// PowerShell les pega un BOM que no se ve y hace fallar SOLO en producción.
+function tokenValido(req) {
+  const esperado = String(process.env.CREAR_PEDIDO_API_TOKEN || '').replace(/[^\x21-\x7E]/g, '');
+  // Falla CERRADO: sin la variable no entra nadie. Un despliegue al que se le
+  // olvidó configurarla no puede quedar abierto al mundo.
+  if (!esperado) return false;
+  const recibido = String(req.headers.authorization || '')
+    .replace(/^Bearer\s+/i, '').replace(/[^\x21-\x7E]/g, '');
+  // Comparación de largo constante (la misma de `api/agent.js`): con `===` el
+  // tiempo de respuesta delata el token carácter por carácter.
+  if (recibido.length !== esperado.length) return false;
+  let dif = 0;
+  for (let i = 0; i < recibido.length; i++) dif |= recibido.charCodeAt(i) ^ esperado.charCodeAt(i);
+  return dif === 0;
+}
+
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.status(200).end();
+  // Sin `Access-Control-Allow-Origin: '*'`: ya no hay ninguna página que deba
+  // llamarlo desde un navegador. Si algún día hace falta, va lista blanca de
+  // orígenes, nunca comodín. Ojo: el comodín también se quitó de vercel.json,
+  // que lo reponía a nivel de plataforma para todo /api/*.
+  if (!tokenValido(req)) return res.status(401).json({ ok: false, error: 'No autorizado' });
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
 
   try {
